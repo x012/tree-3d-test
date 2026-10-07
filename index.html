@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
+<title>Wind Tree · Three.js</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #0b1114;
+    font-family: ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  #stage { position: fixed; inset: 0; }
+  #stage canvas { display: block; }
+
+  .panel {
+    position: fixed; z-index: 10;
+    color: #eaf3ec;
+    background: rgba(10, 18, 16, 0.5);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+    backdrop-filter: blur(12px) saturate(1.2);
+    -webkit-backdrop-filter: blur(12px) saturate(1.2);
+    border-radius: 14px;
+    padding: 13px 16px;
+    user-select: none;
+  }
+  #hud { top: 18px; left: 18px; max-width: 260px; }
+  #hud h1 {
+    margin: 0 0 5px; font-size: 13px; font-weight: 650;
+    letter-spacing: 0.22em; text-transform: uppercase;
+  }
+  #hud p { margin: 0; font-size: 11.5px; line-height: 1.55; color: rgba(234, 243, 236, 0.65); }
+
+  #controls {
+    left: 18px; bottom: 18px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    font-size: 12px;
+  }
+  #controls label { display: flex; align-items: center; gap: 9px; color: rgba(234, 243, 236, 0.85); }
+  #wind { width: 120px; accent-color: #93d46c; cursor: pointer; }
+  #windVal { min-width: 44px; font-variant-numeric: tabular-nums; color: #a7e585; }
+  #controls input[type="checkbox"] { accent-color: #93d46c; cursor: pointer; }
+  #regen {
+    font: inherit; font-size: 12px; padding: 7px 13px;
+    color: #eaf3ec; background: rgba(255, 255, 255, 0.09);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 9px; cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  #regen:hover { background: rgba(255, 255, 255, 0.18); }
+  #regen:active { transform: translateY(1px); }
+
+  #hint {
+    position: fixed; right: 18px; bottom: 20px; z-index: 10;
+    font-size: 11px; letter-spacing: 0.04em;
+    color: rgba(255, 255, 255, 0.5);
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.5);
+    user-select: none; pointer-events: none;
+  }
+  @media (max-width: 640px) {
+    #hud { max-width: 190px; }
+    #hint { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<div class="panel" id="hud">
+  <h1>Wind Tree</h1>
+  <p>Procedurally grown tree with GPU wind sway &mdash; branch bending, leaf flutter and drifting pollen.</p>
+</div>
+
+<div class="panel" id="controls">
+  <label>Wind <input id="wind" type="range" min="0" max="2" step="0.01" value="1" /><span id="windVal">1.00&times;</span></label>
+  <label><input id="orbit" type="checkbox" checked /> auto-orbit</label>
+  <button id="regen" type="button">New tree</button>
+</div>
+
+<div id="hint">drag to orbit &middot; scroll to zoom</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* ------------------------------------------------------------------ *
+ * helpers
+ * ------------------------------------------------------------------ */
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function valueNoise(x, z) {
+  const xi = Math.floor(x), zi = Math.floor(z);
+  const xf = x - xi, zf = z - zi;
+  const h = (a, b) => {
+    const s = Math.sin(a * 127.1 + b * 311.7) * 43758.5453;
+    return s - Math.floor(s);
+  };
+  const u = xf * xf * (3 - 2 * xf);
+  const v = zf * zf * (3 - 2 * zf);
+  const n00 = h(xi, zi), n10 = h(xi + 1, zi);
+  const n01 = h(xi, zi + 1), n11 = h(xi + 1, zi + 1);
+  return (n00 * (1 - u) + n10 * u) * (1 - v) + (n01 * (1 - u) + n11 * u) * v;
+}
+
+const UP = new THREE.Vector3(0, 1, 0);
+const FOG_COLOR = new THREE.Color('#e4ebe2');
+const SUN_DIR = new THREE.Vector3(-0.55, 0.6, 0.45).normalize();
+
+/* ------------------------------------------------------------------ *
+ * renderer / scene / camera
+ * ------------------------------------------------------------------ */
+
+const stage = document.getElementById('stage');
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.setClearColor(FOG_COLOR, 1);
+stage.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(FOG_COLOR, 35, 92);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 600);
+camera.position.set(12, 6.6, 14);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 4.3, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 5;
+controls.maxDistance = 46;
+controls.maxPolarAngle = Math.PI * 0.495;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.4;
+
+/* ------------------------------------------------------------------ *
+ * sky dome (vertex-colour gradient, handled by built-in colour pipeline)
+ * ------------------------------------------------------------------ */
+
+function createSky() {
+  const geo = new THREE.SphereGeometry(300, 48, 24);
+  const pos = geo.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+
+  const cBottom = FOG_COLOR.clone();
+  const cMid = new THREE.Color('#9ec8ee');
+  const cTop = new THREE.Color('#3d8ad9');
+  const sunTint = new THREE.Color('#fff0cf');
+  const dir = new THREE.Vector3();
+  const col = new THREE.Color();
+
+  for (let i = 0; i < pos.count; i++) {
+    dir.fromBufferAttribute(pos, i).normalize();
+    const h = dir.y;
+    col.copy(cBottom)
+      .lerp(cMid, THREE.MathUtils.smoothstep(h, -0.04, 0.3))
+      .lerp(cTop, THREE.MathUtils.smoothstep(h, 0.24, 0.85));
+    const glow = Math.pow(Math.max(dir.dot(SUN_DIR), 0), 40) * 0.85;
+    col.add(sunTint.clone().multiplyScalar(glow));
+    colors[i * 3] = col.r;
+    colors[i * 3 + 1] = col.g;
+    colors[i * 3 + 2] = col.b;
+  }
+
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    vertexColors: true,
+    side: THREE.BackSide,
+    fog: false,
+    depthWrite: false,
+    toneMapped: true
+  }));
+  mesh.renderOrder = -1;
+  mesh.frustumCulled = false;
+  scene.add(mesh);
+}
+createSky();
+
+/* ------------------------------------------------------------------ *
+ * lights
+ * ------------------------------------------------------------------ */
+
+const hemi = new THREE.HemisphereLight(0xc3dcff, 0x6f9a52, 0.72);
+scene.add(hemi);
+
+const sun = new THREE.DirectionalLight(0xfff1d8, 2.3);
+sun.position.copy(SUN_DIR).multiplyScalar(38);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -17;
+sun.shadow.camera.right = 17;
+sun.shadow.camera.top = 19;
+sun.shadow.camera.bottom = -11;
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = 95;
+sun.shadow.bias = -0.0006;
+sun.shadow.normalBias = 0.035;
+scene.add(sun);
+scene.add(sun.target);
+sun.target.position.set(0, 4, 0);
+
+const fill = new THREE.DirectionalLight(0xd6e6ff, 0.5);
+fill.position.set(16, 12, -18);
+scene.add(fill);
+scene.add(fill.target);
+fill.target.position.set(0, 5, 0);
+
+/* ------------------------------------------------------------------ *
+ * ground
+ * ------------------------------------------------------------------ */
+
+function createGround() {
+  const geo = new THREE.PlaneGeometry(200, 200, 84, 84);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+
+  const cDark = new THREE.Color('#4a7a3b');
+  const cLight = new THREE.Color('#7cab54');
+  const cDry = new THREE.Color('#9db85f');
+  const col = new THREE.Color();
+
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    const n1 = valueNoise(x * 0.085, z * 0.085);
+    const n2 = valueNoise(x * 0.42 + 11.3, z * 0.42 - 7.1);
+    const r = Math.hypot(x, z);
+    const flat = THREE.MathUtils.smoothstep(r, 2.6, 9);
+    pos.setY(i, ((n1 - 0.5) * 1.15 + (n2 - 0.5) * 0.3) * 0.5 * flat);
+
+    const t = n1 * 0.62 + n2 * 0.38;
+    col.copy(cDark).lerp(cLight, t);
+    if (n2 > 0.63) col.lerp(cDry, Math.min(1, (n2 - 0.63) * 2.2));
+    colors[i * 3] = col.r;
+    colors[i * 3 + 1] = col.g;
+    colors[i * 3 + 2] = col.b;
+  }
+
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 1,
+    metalness: 0
+  }));
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+}
+createGround();
+
+/* ------------------------------------------------------------------ *
+ * shared wind uniforms + sway shader injection
+ * ------------------------------------------------------------------ */
+
+const uTime = { value: 0 };
+const uWind = { value: new THREE.Vector3(0.8, 0, 0.2) };
+
+const SWAY_PARS = /* glsl */ `
+attribute float aFlex;
+attribute float aPhase;
+uniform vec3 uWind;
+uniform float uTime;
+
+vec3 windDisplace( vec3 p, float flex, float phase, float flutter ) {
+  float t = uTime;
+  float gust = 0.62 + 0.38 * sin( t * 0.53 + p.y * 0.07 + phase * 0.13 );
+  float primary = sin( t * 1.1 + phase + p.y * 0.15 );
+  float secondary = 0.45 * sin( t * 2.15 + phase * 1.7 + p.x * 0.28 + p.z * 0.21 );
+  float micro = flutter * 0.3 * sin( t * 6.5 + phase * 3.0 + p.y * 1.3 );
+  float sway = ( primary + secondary + micro ) * gust;
+  return uWind * ( sway * flex * flex * 0.75 );
+}
+`;
+
+const BRANCH_DISPLACE = /* glsl */ `
+#include <begin_vertex>
+transformed += windDisplace( position, aFlex, aPhase, 0.0 );
+`;
+
+function instancedProjectChunk(tint) {
+  return /* glsl */ `
+vec4 mvPosition = vec4( transformed, 1.0 );
+#ifdef USE_INSTANCING
+	mvPosition = instanceMatrix * mvPosition;
+	vec3 instOrigin = ( instanceMatrix * vec4( 0.0, 0.0, 0.0, 1.0 ) ).xyz;
+	vec3 sway = windDisplace( instOrigin, aFlex, aPhase, 1.0 );
+	sway.y += sin( uTime * 7.0 + aPhase * 5.0 ) * 0.05 * ( 0.4 + length( uWind ) );
+	mvPosition.xyz += sway;
+#else
+	mvPosition.xyz += windDisplace( transformed, aFlex, aPhase, 1.0 );
+#endif
+${tint ? 'vTint = aTint;' : ''}
+mvPosition = modelViewMatrix * mvPosition;
+gl_Position = projectionMatrix * mvPosition;
+`;
+}
+
+const TINT_FRAG = /* glsl */ `
+#include <color_fragment>
+diffuseColor.rgb *= mix( vec3( 0.74, 0.92, 0.58 ), vec3( 1.16, 1.06, 0.84 ), vTint );
+`;
+
+function applySway(material, opts) {
+  const instanced = opts.instanced === true;
+  const tint = opts.tint === true;
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = uTime;
+    shader.uniforms.uWind = uWind;
+    shader.vertexShader = SWAY_PARS +
+      (tint ? 'attribute float aTint;\nvarying float vTint;\n' : '') +
+      shader.vertexShader;
+    if (instanced) {
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <project_vertex>',
+        instancedProjectChunk(tint)
+      );
+    } else {
+      shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', BRANCH_DISPLACE);
+    }
+    if (tint) {
+      shader.fragmentShader = 'varying float vTint;\n' +
+        shader.fragmentShader.replace('#include <color_fragment>', TINT_FRAG);
+    }
+  };
+  material.customProgramCacheKey = () => opts.key;
+  return material;
+}
+
+/* ------------------------------------------------------------------ *
+ * materials
+ * ------------------------------------------------------------------ */
+
+const barkMaterial = applySway(new THREE.MeshStandardMaterial({
+  color: 0x6b4a33,
+  roughness: 0.95,
+  metalness: 0
+}), { key: 'sway-bark-main' });
+
+const barkDepthMaterial = applySway(new THREE.MeshDepthMaterial({
+  depthPacking: THREE.RGBADepthPacking
+}), { key: 'sway-bark-depth' });
+
+const leafTexture = (() => {
+  const s = 128;
+  const c = document.createElement('canvas');
+  c.width = c.height = s;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, s, s);
+
+  ctx.beginPath();
+  ctx.moveTo(s * 0.5, s * 0.04);
+  ctx.bezierCurveTo(s * 0.97, s * 0.26, s * 0.9, s * 0.72, s * 0.5, s * 0.97);
+  ctx.bezierCurveTo(s * 0.1, s * 0.72, s * 0.03, s * 0.26, s * 0.5, s * 0.04);
+  ctx.closePath();
+
+  const g = ctx.createLinearGradient(0, 0, 0, s);
+  g.addColorStop(0, '#c2ea7a');
+  g.addColorStop(0.45, '#6ec247');
+  g.addColorStop(1, '#3d9135');
+  ctx.fillStyle = g;
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(30, 78, 26, 0.5)';
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(s * 0.5, s * 0.1);
+  ctx.lineTo(s * 0.5, s * 0.92);
+  ctx.stroke();
+
+  ctx.lineWidth = 1.6;
+  for (let i = 1; i <= 4; i++) {
+    const y = s * (0.2 + i * 0.16);
+    ctx.beginPath();
+    ctx.moveTo(s * 0.5, y);
+    ctx.lineTo(s * (0.5 - 0.26), y + s * 0.1);
+    ctx.moveTo(s * 0.5, y);
+    ctx.lineTo(s * (0.5 + 0.26), y + s * 0.1);
+    ctx.stroke();
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+})();
+
+const leafMaterial = applySway(new THREE.MeshStandardMaterial({
+  map: leafTexture,
+  alphaTest: 0.5,
+  side: THREE.DoubleSide,
+  roughness: 0.88,
+  metalness: 0
+}), { instanced: true, tint: true, key: 'sway-leaf-main' });
+
+const leafDepthMaterial = applySway(new THREE.MeshDepthMaterial({
+  depthPacking: THREE.RGBADepthPacking,
+  alphaTest: 0.5
+}), { instanced: true, key: 'sway-leaf-depth' });
+
+/* ------------------------------------------------------------------ *
+ * procedural tree
+ * ------------------------------------------------------------------ */
+
+const TREE_CFG = {
+  trunkHeight: 5.0,
+  trunkRadius: 0.36,
+  maxDepth: 3
+};
+
+const FLEX_RATE = [0.3, 0.38, 0.42, 0.45];
+
+function buildTreeData(seed) {
+  const rnd = mulberry32(seed);
+  const branchGeos = [];
+  const leafMatrices = [];
+  const leafFlex = [];
+  const leafPhase = [];
+  const leafTint = [];
+  const dummy = new THREE.Object3D();
+
+  function addSegment(a, b, ra, rb, flexA, flexB, phase) {
+    const dir = b.clone().sub(a);
+    const len = dir.length();
+    if (len < 1e-5) return;
+    const radial = ra > 0.12 ? 8 : ra > 0.05 ? 6 : ra > 0.02 ? 5 : 4;
+    const geo = new THREE.CylinderGeometry(rb, ra, len, radial, 1, true);
+
+    const pos = geo.attributes.position;
+    const flex = new Float32Array(pos.count);
+    const ph = new Float32Array(pos.count);
+    for (let i = 0; i < pos.count; i++) {
+      const t = THREE.MathUtils.clamp((pos.getY(i) + len * 0.5) / len, 0, 1);
+      flex[i] = flexA + (flexB - flexA) * t;
+      ph[i] = phase;
+    }
+    geo.setAttribute('aFlex', new THREE.BufferAttribute(flex, 1));
+    geo.setAttribute('aPhase', new THREE.BufferAttribute(ph, 1));
+
+    const q = new THREE.Quaternion().setFromUnitVectors(UP, dir.normalize());
+    geo.applyQuaternion(q);
+    geo.translate((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5);
+    branchGeos.push(geo);
+  }
+
+  function addLeaves(pos, dir, flex, phase, count, spread) {
+    const d = dir.clone().normalize();
+    for (let i = 0; i < count; i++) {
+      dummy.position.set(
+        pos.x + (rnd() - 0.5) * 0.26,
+        pos.y + (rnd() - 0.5) * 0.22,
+        pos.z + (rnd() - 0.5) * 0.26
+      );
+      dummy.quaternion.setFromUnitVectors(UP, d);
+      dummy.rotateY(rnd() * Math.PI * 2);
+      dummy.rotateX((rnd() - 0.5) * spread);
+      dummy.rotateZ((rnd() - 0.5) * spread * 0.7);
+      dummy.scale.setScalar(0.78 + rnd() * 0.62);
+      dummy.updateMatrix();
+      leafMatrices.push(dummy.matrix.clone());
+      leafFlex.push(Math.min(1.15, flex + 0.05 + rnd() * 0.12));
+      leafPhase.push(phase + rnd() * 0.7);
+      leafTint.push(rnd());
+    }
+  }
+
+  function grow(origin, dir, length, r0, r1, depth, flex0, phase) {
+    const segs = depth === 0 ? 8 : depth === 1 ? 5 : 4;
+    const flexRate = FLEX_RATE[Math.min(depth, FLEX_RATE.length - 1)];
+
+    const pts = [origin.clone()];
+    const p = origin.clone();
+    const d = dir.clone().normalize();
+
+    for (let i = 0; i < segs; i++) {
+      const curv = depth === 0 ? 0.03 : 0.19;
+      d.x += (rnd() - 0.5) * curv;
+      d.z += (rnd() - 0.5) * curv;
+      d.y += depth === 0 ? 0.008 : (i < segs * 0.55 ? 0.06 - 0.015 * depth : -0.03);
+      d.normalize();
+      p.addScaledVector(d, length / segs);
+      pts.push(p.clone());
+    }
+
+    const flexAt = (t) => Math.min(1.1, flex0 + Math.pow(t, 1.5) * flexRate);
+    const radAt = (t) => r0 + (r1 - r0) * t;
+
+    for (let i = 0; i < segs; i++) {
+      const t0 = i / segs;
+      const t1 = (i + 1) / segs;
+      addSegment(pts[i], pts[i + 1], radAt(t0), radAt(t1), flexAt(t0), flexAt(t1), phase);
+    }
+
+    if (depth > 0 && depth < TREE_CFG.maxDepth) {
+      const tip = pts[segs];
+      const tipDir = tip.clone().sub(pts[segs - 1]).normalize();
+      addLeaves(tip, tipDir, flexAt(1), phase, depth === 1 ? 3 : 6, 1.6);
+      if (depth === 2) {
+        for (const t of [0.4, 0.7]) {
+          const i = Math.min(segs - 1, Math.floor(t * segs));
+          const along = pts[i + 1].clone().sub(pts[i]).normalize();
+          addLeaves(pts[i].clone().lerp(pts[i + 1], t * segs - i), along, flexAt(t), phase, 4, 1.8);
+        }
+      }
+    }
+
+    if (depth >= TREE_CFG.maxDepth) {
+      const tip = pts[segs];
+      const tipDir = tip.clone().sub(pts[segs - 1]).normalize();
+      addLeaves(tip, tipDir, flexAt(1), phase, 10, 1.5);
+      for (let i = 1; i < segs; i++) {
+        const along = pts[i + 1].clone().sub(pts[i - 1]).normalize();
+        addLeaves(pts[i], along, flexAt(i / segs), phase, 5, 1.7);
+      }
+      return;
+    }
+
+    const count = depth === 0 ? 5 : depth === 1 ? 2 + (rnd() < 0.6 ? 1 : 0) : 3;
+    const startT = depth === 0 ? 0.46 : depth === 1 ? 0.34 : 0.3;
+
+    for (let c = 0; c < count; c++) {
+      const t = startT + (1 - startT) * ((c + 0.18 + rnd() * 0.64) / count);
+      const idx = Math.min(segs - 1, Math.floor(t * segs));
+      const localT = t * segs - idx;
+      const base = pts[idx].clone().lerp(pts[idx + 1], localT);
+      const along = pts[idx + 1].clone().sub(pts[idx]).normalize();
+
+      let childDir;
+      if (depth === 0) {
+        const tilt = 0.62 + rnd() * 0.42;
+        const az = (c / count) * Math.PI * 2 + rnd() * 1.1;
+        childDir = new THREE.Vector3(
+          Math.sin(tilt) * Math.cos(az),
+          Math.cos(tilt),
+          Math.sin(tilt) * Math.sin(az)
+        );
+      } else {
+        const axis = new THREE.Vector3(rnd() * 2 - 1, rnd() * 2 - 1, rnd() * 2 - 1).cross(along);
+        if (axis.lengthSq() < 1e-6) axis.set(1, 0, 0).cross(along);
+        axis.normalize();
+        childDir = along.clone().applyAxisAngle(axis, 0.5 + rnd() * 0.55);
+      }
+      childDir.y = Math.max(childDir.y, -0.05);
+      childDir.normalize();
+
+      const childLen = length * (depth === 0 ? 0.64 + rnd() * 0.2 : depth === 1 ? 0.66 + rnd() * 0.16 : 0.56 + rnd() * 0.14);
+      const cr0 = Math.max(0.012, radAt(t) * 0.52);
+      const cr1 = cr0 * 0.55;
+      grow(base, childDir, childLen, cr0, cr1, depth + 1, flexAt(t), phase + rnd() * 6.283);
+    }
+  }
+
+  grow(
+    new THREE.Vector3(0, -0.3, 0),
+    new THREE.Vector3((rnd() - 0.5) * 0.1, 1, (rnd() - 0.5) * 0.1),
+    TREE_CFG.trunkHeight,
+    TREE_CFG.trunkRadius,
+    TREE_CFG.trunkRadius * 0.47,
+    0,
+    0,
+    rnd() * 6.283
+  );
+
+  const branchGeometry = mergeGeometries(branchGeos, false);
+  branchGeos.forEach((g) => g.dispose());
+  branchGeometry.computeBoundingBox();
+  branchGeometry.computeBoundingSphere();
+  branchGeometry.boundingSphere.radius += 1.6;
+
+  return {
+    branchGeometry,
+    leafMatrices,
+    leafFlex,
+    leafPhase,
+    leafTint
+  };
+}
+
+function buildLeafGeometry(data) {
+  const geo = new THREE.PlaneGeometry(0.44, 0.66, 1, 2);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    const u = x / 0.22;
+    const along = (y + 0.33) / 0.66;
+    pos.setZ(i, -0.1 * u * u * (0.35 + 0.65 * along));
+  }
+  geo.translate(0, 0.33, 0);
+  geo.computeVertexNormals();
+
+  geo.setAttribute('aFlex', new THREE.InstancedBufferAttribute(new Float32Array(data.leafFlex), 1));
+  geo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(new Float32Array(data.leafPhase), 1));
+  geo.setAttribute('aTint', new THREE.InstancedBufferAttribute(new Float32Array(data.leafTint), 1));
+  return geo;
+}
+
+let treeGroup = null;
+
+function disposeTree(group) {
+  if (!group) return;
+  group.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+  });
+  scene.remove(group);
+}
+
+function plantTree(seed) {
+  disposeTree(treeGroup);
+  const data = buildTreeData(seed);
+  const group = new THREE.Group();
+
+  const bark = new THREE.Mesh(data.branchGeometry, barkMaterial);
+  bark.castShadow = true;
+  bark.receiveShadow = true;
+  bark.customDepthMaterial = barkDepthMaterial;
+  group.add(bark);
+
+  const leafGeo = buildLeafGeometry(data);
+  const leaves = new THREE.InstancedMesh(leafGeo, leafMaterial, data.leafMatrices.length);
+  for (let i = 0; i < data.leafMatrices.length; i++) {
+    leaves.setMatrixAt(i, data.leafMatrices[i]);
+  }
+  leaves.instanceMatrix.needsUpdate = true;
+  leaves.castShadow = true;
+  leaves.receiveShadow = true;
+  leaves.customDepthMaterial = leafDepthMaterial;
+  leaves.computeBoundingSphere();
+  if (leaves.boundingSphere) leaves.boundingSphere.radius += 1.6;
+  group.add(leaves);
+
+  scene.add(group);
+  treeGroup = group;
+}
+
+plantTree((Math.random() * 0xffffffff) >>> 0);
+
+/* ------------------------------------------------------------------ *
+ * pollen
+ * ------------------------------------------------------------------ */
+
+const POLLEN_COUNT = 260;
+const pollenGeo = new THREE.BufferGeometry();
+const pollenPos = new Float32Array(POLLEN_COUNT * 3);
+const pollenVel = new Float32Array(POLLEN_COUNT * 3);
+const pollenPhase = new Float32Array(POLLEN_COUNT);
+
+for (let i = 0; i < POLLEN_COUNT; i++) {
+  pollenPos[i * 3] = (Math.random() - 0.5) * 46;
+  pollenPos[i * 3 + 1] = 0.4 + Math.random() * 11;
+  pollenPos[i * 3 + 2] = (Math.random() - 0.5) * 46;
+  pollenVel[i * 3] = (Math.random() - 0.5) * 0.25;
+  pollenVel[i * 3 + 1] = (Math.random() - 0.5) * 0.1;
+  pollenVel[i * 3 + 2] = (Math.random() - 0.5) * 0.25;
+  pollenPhase[i] = Math.random() * 6.283;
+}
+pollenGeo.setAttribute('position', new THREE.BufferAttribute(pollenPos, 3));
+
+const pollenTexture = (() => {
+  const s = 32;
+  const c = document.createElement('canvas');
+  c.width = c.height = s;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.35, 'rgba(255,252,225,0.75)');
+  g.addColorStop(1, 'rgba(255,252,225,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, s, s);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+})();
+
+const pollen = new THREE.Points(pollenGeo, new THREE.PointsMaterial({
+  map: pollenTexture,
+  size: 0.16,
+  transparent: true,
+  depthWrite: false,
+  opacity: 0.7,
+  sizeAttenuation: true,
+  blending: THREE.AdditiveBlending,
+  color: 0xfff6d8
+}));
+pollen.frustumCulled = false;
+scene.add(pollen);
+
+function updatePollen(dt, t, wind) {
+  const arr = pollenGeo.attributes.position.array;
+  for (let i = 0; i < POLLEN_COUNT; i++) {
+    const i3 = i * 3;
+    const ph = pollenPhase[i];
+    arr[i3] += (wind.x * 0.55 + pollenVel[i3] + Math.sin(t * 0.7 + ph) * 0.12) * dt;
+    arr[i3 + 1] += (pollenVel[i3 + 1] + Math.sin(t * 1.1 + ph * 1.7) * 0.18) * dt;
+    arr[i3 + 2] += (wind.z * 0.55 + pollenVel[i3 + 2] + Math.cos(t * 0.6 + ph) * 0.12) * dt;
+
+    if (arr[i3] > 24) arr[i3] -= 48;
+    else if (arr[i3] < -24) arr[i3] += 48;
+    if (arr[i3 + 2] > 24) arr[i3 + 2] -= 48;
+    else if (arr[i3 + 2] < -24) arr[i3 + 2] += 48;
+    if (arr[i3 + 1] > 12) arr[i3 + 1] = 0.3;
+    else if (arr[i3 + 1] < 0.2) arr[i3 + 1] = 11.8;
+  }
+  pollenGeo.attributes.position.needsUpdate = true;
+}
+
+/* ------------------------------------------------------------------ *
+ * ui
+ * ------------------------------------------------------------------ */
+
+let windLevel = 1;
+const windInput = document.getElementById('wind');
+const windVal = document.getElementById('windVal');
+windInput.addEventListener('input', () => {
+  windLevel = parseFloat(windInput.value);
+  windVal.textContent = windLevel.toFixed(2) + '×';
+});
+
+document.getElementById('orbit').addEventListener('change', (e) => {
+  controls.autoRotate = e.target.checked;
+});
+
+document.getElementById('regen').addEventListener('click', () => {
+  plantTree((Math.random() * 0xffffffff) >>> 0);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ------------------------------------------------------------------ *
+ * loop
+ * ------------------------------------------------------------------ */
+
+const clock = new THREE.Clock();
+const windDir = new THREE.Vector3();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+  uTime.value = t;
+
+  const n1 = Math.sin(t * 0.27) * Math.sin(t * 0.13 + 1.7);
+  const burst = Math.pow(Math.max(0, Math.sin(t * 0.083 + 2.0)), 6);
+  const gust = 0.4 + 0.6 * (0.5 + 0.5 * n1) + 0.55 * burst;
+  const angle = 0.3 * Math.sin(t * 0.19) + 0.14 * Math.sin(t * 0.47);
+
+  windDir.set(Math.cos(angle), 0, Math.sin(angle));
+  uWind.value.copy(windDir).multiplyScalar(0.85 * gust * windLevel);
+
+  updatePollen(dt, t, uWind.value);
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>
